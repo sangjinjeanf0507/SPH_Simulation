@@ -312,14 +312,6 @@ def reinforce_core(n: ti.i32, center: ti.types.vector(3, ti.f32), strength: ti.f
         if dist < core_radius:
             acc[i] += -r.normalized() * strength * (core_radius - dist)
 
-@ti.kernel
-def guide_orbital_particles(n: ti.i32, center: ti.types.vector(3, ti.f32), min_r: ti.f32, G_central: ti.f32):
-    for i in range(n):
-        r = pos[i] - center
-        dist = r.norm()
-        if dist > min_r:
-            dir = ti.Vector([-r[1], r[0], 0.0]).normalized()
-            vel[i] = dir * ti.sqrt(G_central / dist)
 
 def sample_solid_sphere(n, radius, center, dtype=np.float32):
     u = np.random.rand(n).astype(dtype)
@@ -1139,9 +1131,6 @@ def main():
         apply_xsph(N_all, XSPH_EPS)
         for _ in range(10):
             correct_overlap(N_all, PARTICLE_RADIUS_CORE, PARTICLE_RADIUS_MANTLE)
-        if frame == 800:
-            print(f"프레임 {frame}: 궤도 가이드 적용")
-            guide_orbital_particles(N_all, ti.Vector(center_earth.tolist()), 0.32, G * M_earth)
         
         current_positions = pos.to_numpy()[:N_all]
         current_velocities = vel.to_numpy()[:N_all]
