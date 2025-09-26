@@ -176,13 +176,16 @@ def compute_all_forces(n: ti.i32):
                     ti.atomic_add(acc[j][d], -mass[i] * physical_viscosity_force[d])  # j에 대한 물리점성 (반대 부호)
                 
                 # XSPH 계산 (증분만 저장, 나중에 일괄 적용)
-                w_ij = W(r, h_smooth[i])  # 기존 코드와 동일하게 h_smooth[i] 사용
-                xsph_contribution_i = mass[j] * (vel[j] - vel[i]) * w_ij / (density[i] + density[j] + 1e-8)
-                xsph_contribution_j = mass[i] * (vel[i] - vel[j]) * w_ij / (density[i] + density[j] + 1e-8)
+                # 원래 코드와 동일하게 각각 다른 스무딩 길이 사용
+                w_i = W(r, h_smooth[i])
+                w_j = W(r, h_smooth[j])
+                
+                xsph_i = mass[j] * (vel[j] - vel[i]) * w_i / (density[i] + density[j] + 1e-8)
+                xsph_j = mass[i] * (vel[i] - vel[j]) * w_j / (density[i] + density[j] + 1e-8)
                 
                 for d in ti.static(range(DIM)):
-                    ti.atomic_add(xsph_delta[i][d], xsph_contribution_i[d])
-                    ti.atomic_add(xsph_delta[j][d], xsph_contribution_j[d])
+                    ti.atomic_add(xsph_delta[i][d], xsph_i[d])
+                    ti.atomic_add(xsph_delta[j][d], xsph_j[d])
         
         # i에 대한 가속도 누적
         acc[i] += a_i
