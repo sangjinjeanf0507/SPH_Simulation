@@ -79,19 +79,23 @@ def grad_W(r_vec, r, h):
 
 @ti.kernel
 def compute_sph_density(n: ti.i32):
+    # Pass 1: 자기항으로 초기화 (덮어쓰기 OK, 한 번만)
     for i in range(n):
         density[i] = mass[i] * W(0.0, h_smooth[i])
+    
+    # Pass 2: i<j 대칭 합(둘 다 atomic_add)
+    for i in range(n):
         for j in range(i + 1, n):  # 대칭성 이용: i < j만 계산
             r_vec = pos[i] - pos[j]
             r2 = r_vec.dot(r_vec)
-            h_ij = (h_smooth[i] + h_smooth[j]) / 2.0
+            h_ij = (h_smooth[i] + h_smooth[j]) * 0.5
             rcut2 = (2.0 * h_ij) ** 2
             
             if r2 < rcut2:  # 제곱거리 비교로 sqrt 최소화
                 r = ti.sqrt(r2)
-                w_ij = W(r, h_ij)
-                density[i] += mass[j] * w_ij
-                density[j] += mass[i] * w_ij  # 대칭성으로 j에도 누적
+                w = W(r, h_ij)
+                ti.atomic_add(density[i], mass[j] * w)
+                ti.atomic_add(density[j], mass[i] * w)
 
 @ti.kernel
 def compute_sph_pressure(n: ti.i32):
@@ -101,12 +105,18 @@ def compute_sph_pressure(n: ti.i32):
         else:
             pressure[i] = 0.0
 
+# XSPH 증분을 저장할 필드 추가
+xsph_delta = ti.Vector.field(DIM, dtype=ti.f32, shape=MAX_PARTICLES)
+
 @ti.kernel
 def compute_all_forces(n: ti.i32):
-    """통합된 힘 계산: 중력 + SPH 힘 + 점성 + XSPH를 한 번에"""
+    """통합된 힘 계산: 중력 + SPH 힘 + 점성 + XSPH를 한 번에 (수학적으로 정확한 버전)"""
+    # XSPH 증분 초기화
+    for i in range(n):
+        xsph_delta[i] = ti.Vector.zero(ti.f32, DIM)
+    
     for i in range(n):
         a_i = ti.Vector.zero(ti.f32, DIM)
-        delta_i = ti.Vector.zero(ti.f32, DIM)
         
         for j in range(i + 1, n):  # 대칭성 이용: i < j만 계산
             r_vec = pos[i] - pos[j]
@@ -117,9 +127,10 @@ def compute_all_forces(n: ti.i32):
             inv_r3 = 1.0 / (dist2 * ti.sqrt(dist2))
             gravity_force = G * r_vec * inv_r3
             
-            # 중력 쌍대 누적
+            # 중력 쌍대 누적 (뉴턴 3법칙: 반대 부호)
             a_i += mass[j] * gravity_force
-            acc[j] += mass[i] * gravity_force  # j에 대한 중력
+            for d in ti.static(range(DIM)):
+                ti.atomic_add(acc[j][d], -mass[i] * gravity_force[d])  # j에 대한 중력 (반대 부호)
             
             # SPH 관련 계산 (r < 2*h_ij일 때만)
             h_ij = (h_smooth[i] + h_smooth[j]) / 2.0
@@ -134,13 +145,14 @@ def compute_all_forces(n: ti.i32):
                 grad_Wij = grad_W(r_vec, r, h_ij)
                 v_dot_r = (vel[i] - vel[j]).dot(r_vec)
                 
-                # SPH 압력 힘
+                # SPH 압력 힘 (뉴턴 3법칙: 반대 부호)
                 if density[i] > 1e-9 and density[j] > 1e-9:
                     pressure_force = -(pressure[i] / density[i]**2 + pressure[j] / density[j]**2) * grad_Wij
                     a_i += mass[j] * pressure_force
-                    acc[j] += mass[i] * pressure_force  # 쌍대 누적
+                    for d in ti.static(range(DIM)):
+                        ti.atomic_add(acc[j][d], -mass[i] * pressure_force[d])  # j에 대한 압력 (반대 부호)
                 
-                # 인공 점성
+                # 인공 점성 (뉴턴 3법칙: 반대 부호)
                 if v_dot_r < 0:
                     ci = ti.sqrt(GAMMA * pressure[i] / density[i]) if density[i] > 1e-9 else 0.0
                     cj = ti.sqrt(GAMMA * pressure[j] / density[j]) if density[j] > 1e-9 else 0.0
@@ -149,9 +161,10 @@ def compute_all_forces(n: ti.i32):
                     Pi_ij = (-0.1 * c_avg * mu_ij + 0.1 * mu_ij**2) / rho_avg
                     viscosity_force = -Pi_ij * grad_Wij
                     a_i += mass[j] * viscosity_force
-                    acc[j] += mass[i] * viscosity_force  # 쌍대 누적
+                    for d in ti.static(range(DIM)):
+                        ti.atomic_add(acc[j][d], -mass[i] * viscosity_force[d])  # j에 대한 점성 (반대 부호)
                 
-                # 물리적 점성
+                # 물리적 점성 (뉴턴 3법칙: 반대 부호)
                 eps2 = (0.01 * h_avg) ** 2
                 r2_visc = r2 + eps2
                 vij = vel[i] - vel[j]
@@ -159,32 +172,51 @@ def compute_all_forces(n: ti.i32):
                 pij = vij.dot(r_vec) / r2_visc
                 physical_viscosity_force = (2.0 * NU[None]) * pij * gradW_visc / (density[i] * density[j] + 1e-8)
                 a_i += mass[j] * physical_viscosity_force
-                acc[j] += mass[i] * physical_viscosity_force  # 쌍대 누적
+                for d in ti.static(range(DIM)):
+                    ti.atomic_add(acc[j][d], -mass[i] * physical_viscosity_force[d])  # j에 대한 물리점성 (반대 부호)
                 
-                # XSPH 계산
-                w_ij = W(r, h_smooth[i])
-                delta_i += mass[j] * (vel[j] - vel[i]) * w_ij / (density[i] + density[j] + 1e-8)
-                delta_j = mass[i] * (vel[i] - vel[j]) * w_ij / (density[i] + density[j] + 1e-8)
-                vel[j] += XSPH_EPS * delta_j  # j에 대한 XSPH 직접 적용
+                # XSPH 계산 (증분만 저장, 나중에 일괄 적용)
+                w_ij = W(r, h_smooth[i])  # 기존 코드와 동일하게 h_smooth[i] 사용
+                xsph_contribution_i = mass[j] * (vel[j] - vel[i]) * w_ij / (density[i] + density[j] + 1e-8)
+                xsph_contribution_j = mass[i] * (vel[i] - vel[j]) * w_ij / (density[i] + density[j] + 1e-8)
+                
+                for d in ti.static(range(DIM)):
+                    ti.atomic_add(xsph_delta[i][d], xsph_contribution_i[d])
+                    ti.atomic_add(xsph_delta[j][d], xsph_contribution_j[d])
         
-        # i에 대한 누적
+        # i에 대한 가속도 누적
         acc[i] += a_i
-        vel[i] += XSPH_EPS * delta_i
+
+@ti.kernel
+def apply_xsph_unified(n: ti.i32, eps: ti.f32):
+    """XSPH 증분을 일괄 적용 (기존 타이밍과 동일)"""
+    for i in range(n):
+        vel[i] += eps * xsph_delta[i]
 
 @ti.kernel
 def sanitize_particles(n: ti.i32):
     for i in range(n):
-        for d in range(DIM):
-            if tm.isnan(pos[i][d]) or tm.isinf(pos[i][d]):
-                pos[i][d] = 0.0
+        # 3D 벡터의 각 성분을 정적 인덱스로 접근
+        if tm.isnan(pos[i][0]) or tm.isinf(pos[i][0]):
+            pos[i][0] = 0.0
+        if tm.isnan(pos[i][1]) or tm.isinf(pos[i][1]):
+            pos[i][1] = 0.0
+        if tm.isnan(pos[i][2]) or tm.isinf(pos[i][2]):
+            pos[i][2] = 0.0
         
-        for d in range(DIM):
-            if tm.isnan(vel[i][d]) or tm.isinf(vel[i][d]):
-                vel[i][d] = 0.0
+        if tm.isnan(vel[i][0]) or tm.isinf(vel[i][0]):
+            vel[i][0] = 0.0
+        if tm.isnan(vel[i][1]) or tm.isinf(vel[i][1]):
+            vel[i][1] = 0.0
+        if tm.isnan(vel[i][2]) or tm.isinf(vel[i][2]):
+            vel[i][2] = 0.0
         
-        for d in range(DIM):
-            if tm.isnan(acc[i][d]) or tm.isinf(acc[i][d]):
-                acc[i][d] = 0.0
+        if tm.isnan(acc[i][0]) or tm.isinf(acc[i][0]):
+            acc[i][0] = 0.0
+        if tm.isnan(acc[i][1]) or tm.isinf(acc[i][1]):
+            acc[i][1] = 0.0
+        if tm.isnan(acc[i][2]) or tm.isinf(acc[i][2]):
+            acc[i][2] = 0.0
         
         if tm.isnan(density[i]) or tm.isinf(density[i]):
             density[i] = 1.0
@@ -250,13 +282,16 @@ def update_leapfrog_second_half(n: ti.i32, dt: ti.f64):
 
 @ti.kernel
 def correct_overlap(n: ti.i32, r_core: ti.f32, r_mantle: ti.f32):
+    """최적화된 overlap correction: 인자 사용 + 제곱거리 비교"""
+    min2 = (2.0 * r_mantle) ** 2
     for i in range(n):
         for j in range(i + 1, n):
             r = pos[j] - pos[i]
-            dist = r.norm()
-            min_dist = PARTICLE_RADIUS_MANTLE * 2.0
-            if dist < min_dist and dist > 1e-5:
-                delta = r.normalized() * (min_dist - dist) * 0.5
+            r2 = r.dot(r)
+            if r2 < min2 and r2 > 1e-12:
+                dist = ti.sqrt(r2)
+                # (2*r_mantle - dist)만큼 반씩 밀어내기
+                delta = r / dist * (2.0 * r_mantle - dist) * 0.5
                 pos[i] -= delta
                 pos[j] += delta
 
@@ -771,15 +806,20 @@ def main():
                     
                     initialize_sph_fields(N_all)
                     
-                    color_array = []
-                    for i in range(N_all):
-                        color_array.append(0x0080FF)  # 기본 파란색
-                    
+                    # 지구/테이아 개수 계산 (로드 완료 후 N_all 정해진 상태에서)
                     M_earth, M_theia, N_total, core_fraction = 10.0, 1.0, 105000, 0.3  # 기본 입자 10.5만개 (참고 파일과 동일)
                     N_earth = int(N_total / (1 + M_theia / M_earth))  # 105000 / 1.1 = 95455개
                     N_theia = N_total - N_earth  # 105000 - 95455 = 9545개
                     N_earth_core = int(N_earth * 0.1); N_earth_mantle = N_earth - N_earth_core
                     N_theia_core = int(N_theia * 0.1); N_theia_mantle = N_theia - N_theia_core
+                    
+                    # 이제 색상 배열 생성
+                    color_array = np.zeros(N_all, dtype=np.uint32)
+                    color_array[:N_earth_core] = 0xFF0000  # 지구 코어 (빨간색)
+                    color_array[N_earth_core:N_earth] = 0x0080FF  # 지구 맨틀 (파란색)
+                    color_array[N_earth:N_earth+N_theia_core] = 0x8B4513  # 테이아 코어 (갈색)
+                    color_array[N_earth+N_theia_core:N_earth+N_theia] = 0x0000FF  # 테이아 맨틀 (파란색)
+                    color_array[N_earth+N_theia:] = 0x00FF00  # 보간 입자 (초록색)
                     R_earth, R_theia = 0.24, 0.14
                     center_earth = np.array([0.0, 0.0, 0.0])
                     center_theia = np.array([0.65, 0.0, 0.0])
@@ -836,14 +876,13 @@ def main():
                     all_pos = np.concatenate([pe, pt], axis=0)
                     all_vel = np.concatenate([ve, vt], axis=0)
                     all_mass = np.concatenate([me, mt], axis=0)
-                    color_array = []
+                    
+                    # 입자 데이터를 Taichi 필드에 저장
                     for i in range(len(pe)):
                         pos[i], vel[i], mass[i] = ti.Vector(pe[i]), ti.Vector(ve[i]), me[i]
-                        color_array.append(0xFF0000 if i < N_earth_core else 0x0080FF)
                     for i in range(len(pt)):
                         idx = len(pe) + i
                         pos[idx], vel[idx], mass[idx] = ti.Vector(pt[i]), ti.Vector(vt[i]), mt[i]
-                        color_array.append(0x8B4513 if i < N_theia_core else 0x0000FF)  # 테이아 색상 (코어: 갈색, 맨틀: 파란색)
                     N_all = len(all_pos)
                     
                     initialize_sph_fields(N_all)
@@ -859,18 +898,24 @@ def main():
                             pos[idx] = ti.Vector(interp_pos)
                             vel[idx] = ti.Vector(interp_vel)
                             mass[idx] = all_mass[0] * 0.8
-                            color_array.append(0x00FF00)
                     else:
                         for i, (interp_pos, interp_vel) in enumerate(interpolated):
                             idx = N_all + i
                             pos[idx] = ti.Vector(interp_pos)
                             vel[idx] = ti.Vector(interp_vel)
                             mass[idx] = all_mass[0] * 0.8
-                            color_array.append(0x00FF00)
                     
                     N_all = len(all_pos) + len(interpolated)
                     
                     initialize_sph_fields(N_all)
+                    
+                    # 색상 배열 초기화 (1회만 생성)
+                    color_array = np.zeros(N_all, dtype=np.uint32)
+                    color_array[:N_earth_core] = 0xFF0000  # 지구 코어 (빨간색)
+                    color_array[N_earth_core:N_earth] = 0x0080FF  # 지구 맨틀 (파란색)
+                    color_array[N_earth:N_earth+N_theia_core] = 0x8B4513  # 테이아 코어 (갈색)
+                    color_array[N_earth+N_theia_core:N_earth+N_theia] = 0x0000FF  # 테이아 맨틀 (파란색)
+                    color_array[N_earth+N_theia:] = 0x00FF00  # 보간 입자 (초록색)
                     
                     
                     # 생성된 입자 수 출력
@@ -914,11 +959,18 @@ def main():
                         pos[idx] = ti.Vector(interp_pos)
                         vel[idx] = ti.Vector(interp_vel)
                         mass[idx] = all_mass[0] * 0.8
-                        color_array.append(0x00FF00)
                     
                     N_all = len(all_pos) + len(interpolated)
                     
                     initialize_sph_fields(N_all)
+                    
+                    # 색상 배열 초기화 (1회만 생성)
+                    color_array = np.zeros(N_all, dtype=np.uint32)
+                    color_array[:N_earth_core] = 0xFF0000  # 지구 코어 (빨간색)
+                    color_array[N_earth_core:N_earth] = 0x0080FF  # 지구 맨틀 (파란색)
+                    color_array[N_earth:N_earth+N_theia_core] = 0x8B4513  # 테이아 코어 (갈색)
+                    color_array[N_earth+N_theia_core:N_earth+N_theia] = 0x0000FF  # 테이아 맨틀 (파란색)
+                    color_array[N_earth+N_theia:] = 0x00FF00  # 보간 입자 (초록색)
                     
                     # 생성된 입자 수 출력
                     print(f"=== 입자 생성 완료 ===")
@@ -968,14 +1020,13 @@ def main():
             all_pos = np.concatenate([pe, pt], axis=0)
             all_vel = np.concatenate([ve, vt], axis=0)
             all_mass = np.concatenate([me, mt], axis=0)
-            color_array = []
+            
+            # 입자 데이터를 Taichi 필드에 저장
             for i in range(len(pe)):
                 pos[i], vel[i], mass[i] = ti.Vector(pe[i]), ti.Vector(ve[i]), me[i]
-                color_array.append(0xFF0000 if i < N_earth_core else 0x0080FF)
             for i in range(len(pt)):
                 idx = len(pe) + i
                 pos[idx], vel[idx], mass[idx] = ti.Vector(pt[i]), ti.Vector(vt[i]), mt[i]
-                color_array.append(0x8B4513 if i < N_theia_core else 0x0000FF)
             N_all = len(all_pos)
             
             interpolated = interpolate_with_gan(gan_model_path, np.array(all_pos), np.array(all_vel), radius=0.01, interpolation_ratio=0.3)
@@ -1002,6 +1053,14 @@ def main():
             
             initialize_sph_fields(N_all)
             
+            # 색상 배열 초기화 (1회만 생성)
+            color_array = np.zeros(N_all, dtype=np.uint32)
+            color_array[:N_earth_core] = 0xFF0000  # 지구 코어 (빨간색)
+            color_array[N_earth_core:N_earth] = 0x0080FF  # 지구 맨틀 (파란색)
+            color_array[N_earth:N_earth+N_theia_core] = 0x8B4513  # 테이아 코어 (갈색)
+            color_array[N_earth+N_theia_core:N_earth+N_theia] = 0x0000FF  # 테이아 맨틀 (파란색)
+            color_array[N_earth+N_theia:] = 0x00FF00  # 보간 입자 (초록색)
+            
             # 생성된 입자 수 출력
             print(f"=== 입자 생성 완료 ===")
             print(f"기본 입자 수: {len(all_pos):,}개")
@@ -1022,14 +1081,13 @@ def main():
             all_pos = np.concatenate([pe, pt], axis=0)
             all_vel = np.concatenate([ve, vt], axis=0)
             all_mass = np.concatenate([me, mt], axis=0)
-            color_array = []
+            
+            # 입자 데이터를 Taichi 필드에 저장
             for i in range(len(pe)):
                 pos[i], vel[i], mass[i] = ti.Vector(pe[i]), ti.Vector(ve[i]), me[i]
-                color_array.append(0xFF0000 if i < N_earth_core else 0x0080FF)
             for i in range(len(pt)):
                 idx = len(pe) + i
                 pos[idx], vel[idx], mass[idx] = ti.Vector(pt[i]), ti.Vector(vt[i]), mt[i]
-                color_array.append(0x8B4513 if i < N_theia_core else 0x0000FF)
             N_all = len(all_pos)
             
             interpolated = interpolate_with_gan(gan_model_path, np.array(all_pos), np.array(all_vel), radius=0.01, interpolation_ratio=0.3)
@@ -1039,11 +1097,18 @@ def main():
                 pos[idx] = ti.Vector(interp_pos)
                 vel[idx] = ti.Vector(interp_vel)
                 mass[idx] = all_mass[0] * 0.8
-                color_array.append(0x00FF00)
             
             N_all = len(all_pos) + len(interpolated)
             
             initialize_sph_fields(N_all)
+            
+            # 색상 배열 초기화 (1회만 생성)
+            color_array = np.zeros(N_all, dtype=np.uint32)
+            color_array[:N_earth_core] = 0xFF0000  # 지구 코어 (빨간색)
+            color_array[N_earth_core:N_earth] = 0x0080FF  # 지구 맨틀 (파란색)
+            color_array[N_earth:N_earth+N_theia_core] = 0x8B4513  # 테이아 코어 (갈색)
+            color_array[N_earth+N_theia_core:N_earth+N_theia] = 0x0000FF  # 테이아 맨틀 (파란색)
+            color_array[N_earth+N_theia:] = 0x00FF00  # 보간 입자 (초록색)
             
             # 생성된 입자 수 출력
             print(f"=== 입자 생성 완료 ===")
@@ -1097,7 +1162,7 @@ def main():
         reset_acc(N_all)
         compute_sph_density(N_all)
         compute_sph_pressure(N_all)
-        compute_all_forces(N_all)  # 통합된 힘 계산 (중력 + SPH + 점성 + XSPH)
+        compute_all_forces(N_all)  # 통합된 힘 계산 (중력 + SPH + 점성)
         apply_cohesion(N_all, 0.5, 0.4)
         clamp_escape_particles(N_earth, ti.Vector(center_earth.tolist()), 0.5)
         reinforce_core(N_earth, ti.Vector(center_earth.tolist()), 100.0, 0.05)
@@ -1107,15 +1172,19 @@ def main():
         update(N_all, current_dt)
         
         clamp_velocities(N_all)
-        for _ in range(10):
-            correct_overlap(N_all, PARTICLE_RADIUS_CORE, PARTICLE_RADIUS_MANTLE)
+        apply_xsph_unified(N_all, XSPH_EPS)  # XSPH를 기존 타이밍에 적용
+        correct_overlap(N_all, PARTICLE_RADIUS_CORE, PARTICLE_RADIUS_MANTLE)  # 1번만 호출
         
-        current_positions = pos.to_numpy()[:N_all]
-        current_velocities = vel.to_numpy()[:N_all]
-        current_masses = mass.to_numpy()[:N_all]
+        # 성능 최적화: to_numpy() 한 번만 호출
+        np_pos = pos.to_numpy()[:N_all]
+        
+        # CSV 저장용 (필요시에만)
+        # current_positions = np_pos
+        # current_velocities = vel.to_numpy()[:N_all]
+        # current_masses = mass.to_numpy()[:N_all]
         # save_particles_to_csv(current_positions, current_velocities, current_masses, frame, csv_filename, len(all_pos), "C:/Users/sunma/particles_simulation_data.csv")
         
-        np_pos = pos.to_numpy()[:N_all]
+        # GUI 렌더링
         camera_angle = frame * 0.01
         cos_a, sin_a = np.cos(camera_angle), np.sin(camera_angle)
         rotation_matrix = np.array([[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]])
@@ -1128,27 +1197,7 @@ def main():
         n = pos_2d.shape[0]
         radii = np.full(n, 1.5, dtype=np.float32)
         
-        color_array = np.zeros(n, dtype=np.uint32)
-        
-        for i in range(N_earth_core):
-            if i < n:
-                color_array[i] = 0xFF0000
-        
-        for i in range(N_earth_core, N_earth):
-            if i < n:
-                color_array[i] = 0x0080FF
-                
-        for i in range(N_earth, N_earth + N_theia_core):
-            if i < n:
-                color_array[i] = 0x8B4513
-                
-        for i in range(N_earth + N_theia_core, N_earth + N_theia):
-            if i < n:
-                color_array[i] = 0x0000FF
-        
-        for i in range(N_earth + N_theia, n):
-            color_array[i] = 0x00FF00
-        
+        # 색상 배열은 이미 초기화 시 생성됨 (재사용)
         gui.circles(pos_2d, radius=radii, color=color_array)
         
         if frame % 100 == 0:
