@@ -81,13 +81,17 @@ def grad_W(r_vec, r, h):
 def compute_sph_density(n: ti.i32):
     for i in range(n):
         density[i] = mass[i] * W(0.0, h_smooth[i])
-        for j in range(n):
-            if i != j:
-                r_vec = pos[i] - pos[j]
-                r = r_vec.norm()
-                h_ij = (h_smooth[i] + h_smooth[j]) / 2.0
-                if r < 2.0 * h_ij:
-                    density[i] += mass[j] * W(r, h_ij)
+        for j in range(i + 1, n):  # 대칭성 이용: i < j만 계산
+            r_vec = pos[i] - pos[j]
+            r2 = r_vec.dot(r_vec)
+            h_ij = (h_smooth[i] + h_smooth[j]) / 2.0
+            rcut2 = (2.0 * h_ij) ** 2
+            
+            if r2 < rcut2:  # 제곱거리 비교로 sqrt 최소화
+                r = ti.sqrt(r2)
+                w_ij = W(r, h_ij)
+                density[i] += mass[j] * w_ij
+                density[j] += mass[i] * w_ij  # 대칭성으로 j에도 누적
 
 @ti.kernel
 def compute_sph_pressure(n: ti.i32):
@@ -98,35 +102,74 @@ def compute_sph_pressure(n: ti.i32):
             pressure[i] = 0.0
 
 @ti.kernel
-def compute_sph_forces(n: ti.i32):
+def compute_all_forces(n: ti.i32):
+    """통합된 힘 계산: 중력 + SPH 힘 + 점성 + XSPH를 한 번에"""
     for i in range(n):
-        a = ti.Vector.zero(ti.f32, DIM)
+        a_i = ti.Vector.zero(ti.f32, DIM)
+        delta_i = ti.Vector.zero(ti.f32, DIM)
         
-        for j in range(n):
-            if i != j:
-                r_vec = pos[i] - pos[j]
-                r = r_vec.norm()
-                h_ij = (h_smooth[i] + h_smooth[j]) / 2.0
+        for j in range(i + 1, n):  # 대칭성 이용: i < j만 계산
+            r_vec = pos[i] - pos[j]
+            r2 = r_vec.dot(r_vec)
+            
+            # 중력 계산 (항상 수행)
+            dist2 = r2 + EPS**2
+            inv_r3 = 1.0 / (dist2 * ti.sqrt(dist2))
+            gravity_force = G * r_vec * inv_r3
+            
+            # 중력 쌍대 누적
+            a_i += mass[j] * gravity_force
+            acc[j] += mass[i] * gravity_force  # j에 대한 중력
+            
+            # SPH 관련 계산 (r < 2*h_ij일 때만)
+            h_ij = (h_smooth[i] + h_smooth[j]) / 2.0
+            rcut2 = (2.0 * h_ij) ** 2
+            
+            if r2 < rcut2 and r2 > 1e-18:  # 제곱거리 비교로 sqrt 최소화
+                r = ti.sqrt(r2)
+                h_avg = h_ij
+                rho_avg = (density[i] + density[j]) / 2.0
                 
-                if r < 1e-9 or r > 2.0 * h_ij:
-                    continue
-                    
+                # 공통 계산값들
                 grad_Wij = grad_W(r_vec, r, h_ij)
+                v_dot_r = (vel[i] - vel[j]).dot(r_vec)
                 
+                # SPH 압력 힘
                 if density[i] > 1e-9 and density[j] > 1e-9:
-                    a += -mass[j] * (pressure[i] / density[i]**2 + pressure[j] / density[j]**2) * grad_Wij
-                    v_dot_r = (vel[i] - vel[j]).dot(r_vec)
-                    if v_dot_r < 0:
-                        h_avg = (h_smooth[i] + h_smooth[j]) / 2.0
-                        rho_avg = (density[i] + density[j]) / 2.0
-                        ci = ti.sqrt(GAMMA * pressure[i] / density[i]) if density[i] > 1e-9 else 0.0
-                        cj = ti.sqrt(GAMMA * pressure[j] / density[j]) if density[j] > 1e-9 else 0.0
-                        c_avg = 0.5 * (ci + cj)
-                        mu_ij = h_avg * v_dot_r / (r**2 + h_avg**2 * 0.01)
-                        Pi_ij = (-0.1 * c_avg * mu_ij + 0.1 * mu_ij**2) / rho_avg
-                        a += -mass[j] * Pi_ij * grad_Wij
+                    pressure_force = -(pressure[i] / density[i]**2 + pressure[j] / density[j]**2) * grad_Wij
+                    a_i += mass[j] * pressure_force
+                    acc[j] += mass[i] * pressure_force  # 쌍대 누적
+                
+                # 인공 점성
+                if v_dot_r < 0:
+                    ci = ti.sqrt(GAMMA * pressure[i] / density[i]) if density[i] > 1e-9 else 0.0
+                    cj = ti.sqrt(GAMMA * pressure[j] / density[j]) if density[j] > 1e-9 else 0.0
+                    c_avg = 0.5 * (ci + cj)
+                    mu_ij = h_avg * v_dot_r / (r2 + h_avg**2 * 0.01)
+                    Pi_ij = (-0.1 * c_avg * mu_ij + 0.1 * mu_ij**2) / rho_avg
+                    viscosity_force = -Pi_ij * grad_Wij
+                    a_i += mass[j] * viscosity_force
+                    acc[j] += mass[i] * viscosity_force  # 쌍대 누적
+                
+                # 물리적 점성
+                eps2 = (0.01 * h_avg) ** 2
+                r2_visc = r2 + eps2
+                vij = vel[i] - vel[j]
+                gradW_visc = grad_W(r_vec, ti.sqrt(r2_visc), h_avg)
+                pij = vij.dot(r_vec) / r2_visc
+                physical_viscosity_force = (2.0 * NU[None]) * pij * gradW_visc / (density[i] * density[j] + 1e-8)
+                a_i += mass[j] * physical_viscosity_force
+                acc[j] += mass[i] * physical_viscosity_force  # 쌍대 누적
+                
+                # XSPH 계산
+                w_ij = W(r, h_smooth[i])
+                delta_i += mass[j] * (vel[j] - vel[i]) * w_ij / (density[i] + density[j] + 1e-8)
+                delta_j = mass[i] * (vel[i] - vel[j]) * w_ij / (density[i] + density[j] + 1e-8)
+                vel[j] += XSPH_EPS * delta_j  # j에 대한 XSPH 직접 적용
         
-        acc[i] += a
+        # i에 대한 누적
+        acc[i] += a_i
+        vel[i] += XSPH_EPS * delta_i
 
 @ti.kernel
 def sanitize_particles(n: ti.i32):
@@ -187,50 +230,12 @@ def compute_adaptive_dt(n: ti.i32):
     
     dt_adaptive[None] = ti.min(DT_MAX, ti.max(DT_MIN, ti.min(dt_v, dt_a)))
 
-@ti.kernel
-def apply_xsph(n: ti.i32, eps: ti.f32):
-    for i in range(n):
-        delta = ti.Vector.zero(ti.f32, DIM)
-        for j in range(n):
-            if i != j:
-                rij = pos[j] - pos[i]
-                r = ti.sqrt(rij.dot(rij))
-                if r < 2.0 * h_smooth[i]:
-                    w = W(r, h_smooth[i])
-                    delta += mass[j] * (vel[j] - vel[i]) * w / (density[i] + density[j] + 1e-8)
-        vel[i] += eps * delta
-
-@ti.kernel
-def accumulate_physical_viscosity(n: ti.i32):
-    for i in range(n):
-        a = ti.Vector.zero(ti.f32, DIM)
-        for j in range(n):
-            if i != j:
-                h_avg = 0.5 * (h_smooth[i] + h_smooth[j])
-                eps2 = (0.01 * h_avg) * (0.01 * h_avg)
-                rij = pos[j] - pos[i]
-                r2 = rij.dot(rij) + eps2
-                r = ti.sqrt(r2)
-                vij = vel[i] - vel[j]
-                gradW = grad_W(rij, r, h_avg)
-                pij = vij.dot(rij) / r2
-                a += (2.0 * NU[None]) * mass[j] * pij * gradW / (density[i] * density[j] + 1e-8)
-        acc[i] += a
 
 @ti.kernel
 def reset_acc(n: ti.i32):
     for i in range(n):
         acc[i] = ti.Vector.zero(ti.f32, DIM)
 
-@ti.kernel
-def compute_gravity(n: ti.i32):
-    for i in range(n):
-        for j in range(n):
-            if i != j:
-                r = pos[j] - pos[i]
-                dist2 = r.dot(r) + EPS**2
-                inv_r3 = 1.0 / (dist2 * ti.sqrt(dist2))
-                acc[i] += G * mass[j] * r * inv_r3
 
 @ti.kernel
 def update(n: ti.i32, dt: ti.f32):
@@ -1092,9 +1097,7 @@ def main():
         reset_acc(N_all)
         compute_sph_density(N_all)
         compute_sph_pressure(N_all)
-        compute_sph_forces(N_all)
-        accumulate_physical_viscosity(N_all)
-        compute_gravity(N_all)
+        compute_all_forces(N_all)  # 통합된 힘 계산 (중력 + SPH + 점성 + XSPH)
         apply_cohesion(N_all, 0.5, 0.4)
         clamp_escape_particles(N_earth, ti.Vector(center_earth.tolist()), 0.5)
         reinforce_core(N_earth, ti.Vector(center_earth.tolist()), 100.0, 0.05)
@@ -1104,7 +1107,6 @@ def main():
         update(N_all, current_dt)
         
         clamp_velocities(N_all)
-        apply_xsph(N_all, XSPH_EPS)
         for _ in range(10):
             correct_overlap(N_all, PARTICLE_RADIUS_CORE, PARTICLE_RADIUS_MANTLE)
         
